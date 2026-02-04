@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"path"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,42 @@ import (
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/walk"
 )
+
+// isNetworkError checks if an error is a network-related error that indicates
+// the upstream is unreachable
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for fserrors retry types
+	if fserrors.IsRetryError(err) || fserrors.IsNoRetryError(err) {
+		return true
+	}
+	// Check for net.Error (timeout, connection refused, etc.)
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// Check for common network error strings in the error message
+	errStr := err.Error()
+	networkErrors := []string{
+		"network is unreachable",
+		"no route to host",
+		"connection refused",
+		"connection reset",
+		"i/o timeout",
+		"timeout",
+		"dial tcp",
+		"no such host",
+		"connection timed out",
+	}
+	for _, s := range networkErrors {
+		if strings.Contains(strings.ToLower(errStr), s) {
+			return true
+		}
+	}
+	return false
+}
 
 // Register with Fs
 func init() {
@@ -154,7 +191,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 			return
 		}
 		// Skip inaccessible upstreams
-		if fserrors.IsRetryError(err) || fserrors.IsNoRetryError(err) {
+		if isNetworkError(err) {
 			return
 		}
 		errMsgs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
@@ -290,7 +327,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 			return
 		}
 		// Skip inaccessible upstreams
-		if fserrors.IsRetryError(err) || fserrors.IsNoRetryError(err) {
+		if isNetworkError(err) {
 			return
 		}
 		errMsgs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
@@ -474,7 +511,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 			return
 		}
 		// Skip inaccessible upstreams
-		if fserrors.IsRetryError(err) || fserrors.IsNoRetryError(err) {
+		if isNetworkError(err) {
 			return
 		}
 		errMsgs[i] = fmt.Errorf("%s: %w", du.Name()+":"+du.Root(), err)
@@ -981,18 +1018,35 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	})
 	var usedUpstreams []*upstream.Fs
 	var fserr error
+	var unreachable []string
 	for i, err := range errs {
-		if err != nil && err != fs.ErrorIsFile {
-			return nil, err
+		if err == nil {
+			if upstreams[i] != nil {
+				usedUpstreams = append(usedUpstreams, upstreams[i])
+			}
+			continue
 		}
-		// Only the upstreams returns ErrorIsFile would be used if any
 		if err == fs.ErrorIsFile {
-			usedUpstreams = append(usedUpstreams, upstreams[i])
+			if upstreams[i] != nil {
+				usedUpstreams = append(usedUpstreams, upstreams[i])
+			}
 			fserr = fs.ErrorIsFile
+			continue
 		}
+		if isNetworkError(err) {
+			unreachable = append(unreachable, opt.Upstreams[i]+": "+err.Error())
+			continue
+		}
+		// For other errors, skip this upstream but log as warning
+		unreachable = append(unreachable, opt.Upstreams[i]+": "+err.Error())
 	}
-	if fserr == nil {
-		usedUpstreams = upstreams
+	if len(usedUpstreams) == 0 {
+		return nil, errors.New("union: all upstreams are unreachable or errored - check the value of the upstreams setting")
+	}
+	if len(unreachable) > 0 {
+		for _, msg := range unreachable {
+			fs.Infof(name, "union: ignoring unreachable upstream: %s", msg)
+		}
 	}
 
 	f := &Fs{
@@ -1045,12 +1099,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		PartialUploads:           true,
 	}).Fill(ctx, f)
 	canMove, slowHash := true, false
-	for _, f := range upstreams {
-		features = features.Mask(ctx, f) // Mask all upstream fs
-		if !operations.CanServerSideMove(f) {
+	for _, u := range usedUpstreams {
+		features = features.Mask(ctx, u) // Mask all upstream fs
+		if !operations.CanServerSideMove(u) {
 			canMove = false
 		}
-		slowHash = slowHash || f.Features().SlowHash
+		slowHash = slowHash || u.Features().SlowHash
 	}
 	// We can move if all remotes support Move or Copy
 	if canMove {
@@ -1063,7 +1117,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Enable ListR when upstreams either support ListR or is local
 	// But not when all upstreams are local
 	if features.ListR == nil {
-		for _, u := range upstreams {
+		for _, u := range usedUpstreams {
 			if u.Features().ListR != nil {
 				features.ListR = f.ListR
 			} else if !u.Features().IsLocal {
@@ -1082,8 +1136,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = features
 
 	// Get common intersection of hashes
-	hashSet := f.upstreams[0].Hashes()
-	for _, u := range f.upstreams[1:] {
+	hashSet := usedUpstreams[0].Hashes()
+	for _, u := range usedUpstreams[1:] {
 		hashSet = hashSet.Overlap(u.Hashes())
 	}
 	f.hashSet = hashSet
