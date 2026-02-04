@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rclone/rclone/fs/fserrors"
+
 	"github.com/rclone/rclone/backend/union/common"
 	"github.com/rclone/rclone/backend/union/policy"
 	"github.com/rclone/rclone/backend/union/upstream"
@@ -134,14 +136,41 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		}
 		return err
 	}
-	errs := Errors(make([]error, len(upstreams)))
+	success := false
+	dirNotEmpty := false
+	errMsgs := make([]error, len(upstreams))
 	multithread(len(upstreams), func(i int) {
 		err := upstreams[i].Rmdir(ctx, dir)
-		if err != nil {
-			errs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
+		if err == nil {
+			success = true
+			return
 		}
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return
+		}
+		if errors.Is(err, fs.ErrorDirectoryNotEmpty) {
+			dirNotEmpty = true
+			errMsgs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
+			return
+		}
+		// Skip inaccessible upstreams
+		if fserrors.IsRetryError(err) || fserrors.IsNoRetryError(err) {
+			return
+		}
+		errMsgs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
 	})
-	return errs.Err()
+	if success {
+		return nil
+	}
+	if dirNotEmpty {
+		return fs.ErrorDirectoryNotEmpty
+	}
+	for _, e := range errMsgs {
+		if e != nil {
+			return e
+		}
+	}
+	return fs.ErrorDirNotFound
 }
 
 // Hashes returns hash.HashNone to indicate remote hashing is unavailable
@@ -249,17 +278,32 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
-	errs := Errors(make([]error, len(upstreams)))
+	success := false
+	errMsgs := make([]error, len(upstreams))
 	multithread(len(upstreams), func(i int) {
 		err := upstreams[i].Features().Purge(ctx, dir)
 		if errors.Is(err, fs.ErrorDirNotFound) {
-			err = nil
+			return
 		}
-		if err != nil {
-			errs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
+		if err == nil {
+			success = true
+			return
 		}
+		// Skip inaccessible upstreams
+		if fserrors.IsRetryError(err) || fserrors.IsNoRetryError(err) {
+			return
+		}
+		errMsgs[i] = fmt.Errorf("%s: %w", upstreams[i].Name(), err)
 	})
-	return errs.Err()
+	if success {
+		return nil
+	}
+	for _, e := range errMsgs {
+		if e != nil {
+			return e
+		}
+	}
+	return fs.ErrorDirNotFound
 }
 
 // Copy src to this remote using server-side copy operations.
@@ -407,7 +451,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 			return fs.ErrorCantDirMove
 		}
 	}
-	errs := Errors(make([]error, len(upstreams)))
+	success := false
+	errMsgs := make([]error, len(upstreams))
 	multithread(len(upstreams), func(i int) {
 		su := upstreams[i]
 		var du *upstream.Fs
@@ -417,21 +462,29 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 			}
 		}
 		if du == nil {
-			errs[i] = fmt.Errorf("%s: %s: %w", su.Name(), su.Root(), fs.ErrorCantDirMove)
+			errMsgs[i] = fmt.Errorf("%s: %s: %w", su.Name(), su.Root(), fs.ErrorCantDirMove)
 			return
 		}
 		err := du.Features().DirMove(ctx, su.Fs, srcRemote, dstRemote)
-		if err != nil {
-			errs[i] = fmt.Errorf("%s: %w", du.Name()+":"+du.Root(), err)
+		if err == nil {
+			success = true
+			return
 		}
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return
+		}
+		// Skip inaccessible upstreams
+		if fserrors.IsRetryError(err) || fserrors.IsNoRetryError(err) {
+			return
+		}
+		errMsgs[i] = fmt.Errorf("%s: %w", du.Name()+":"+du.Root(), err)
 	})
-	errs = errs.FilterNil()
-	if len(errs) == 0 {
+	if success {
 		return nil
 	}
-	for _, e := range errs {
-		if !errors.Is(e, fs.ErrorDirExists) {
-			return errs
+	for _, e := range errMsgs {
+		if e != nil && !errors.Is(e, fs.ErrorDirExists) {
+			return e
 		}
 	}
 	return fs.ErrorDirExists
